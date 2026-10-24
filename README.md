@@ -44,7 +44,7 @@ Home Assistant 自定义卡片，用于展示「网上国网」户号的电费�
 ### HACS（推荐）
 
 1. HACS → 前端 → 右上角 ⋮ → **自定义存储库**
-2. 填入本仓库地址，类别选择 **Lovelace**
+2. 填入本仓库地址:`https://github.com/hxf14789/State-Grid-Electricity-Card`，类别选择 **仪表盘**
 3. 搜索「State Grid Electricity Card」→ 下载
 4. 刷新页面（首次可能需要重启 HA 或强制刷新浏览器缓存）
 
