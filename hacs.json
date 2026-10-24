@@ -1,0 +1,8 @@
+{
+  "name": "State Grid Electricity Card",
+  "render_readme": true,
+  "filename": "elec-dashboard.js",
+  "content_in_root": false,
+  "homeassistant": "2023.8.0",
+  "hacs": "1.32.0"
+}
