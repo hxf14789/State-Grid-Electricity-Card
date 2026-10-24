@@ -237,4 +237,4 @@ accounts:
 
 ## 许可
 
-MIT
+AGPL-3.0 license
