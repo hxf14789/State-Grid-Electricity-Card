@@ -7,6 +7,17 @@
 const ACCOUNT_KEY = "elec-account";
 const ACCOUNT_EVENT = "elec-account-changed";
 
+// 概览卡片的 Tab（年/月/日）与下方趋势图的视图粒度联动
+const PERIOD_KEY = "elec-period";
+const PERIOD_EVENT = "elec-period-changed";
+function getPeriod() {
+  try { return localStorage.getItem(PERIOD_KEY); } catch (e) { return null; }
+}
+function setPeriod(p) {
+  try { localStorage.setItem(PERIOD_KEY, p); } catch (e) { /* ignore */ }
+  window.dispatchEvent(new CustomEvent(PERIOD_EVENT, { detail: p }));
+}
+
 const BASE_CSS = `
 :host{display:block;width:100%}
 .wrap{
@@ -80,7 +91,7 @@ function setAccount(key) {
   window.dispatchEvent(new CustomEvent(ACCOUNT_EVENT, { detail: key }));
 }
 
-const VERSION = "v1.0.0";
+const VERSION = "v1.1.0";
 
 function accNumber(acc, hass) {
   // YAML 会把 no: 解析成布尔 false，这里兼容所有可能写法
@@ -213,6 +224,9 @@ class ElecSummaryCard extends HTMLElement {
 
   _render() {
     if (!this._hass || !this._config) return;
+    // 同步趋势图视图粒度：点「月用电」→ 月度视图，其余 → 日用电视图
+    const wantPeriod = this._tab === "month" ? "month" : "day";
+    if (getPeriod() !== wantPeriod) setPeriod(wantPeriod);
     const hass = this._hass;
     const key = getAccount(this._config);
     const acc = this._config.accounts.find((a) => a.key === key) || this._config.accounts[0];
@@ -321,17 +335,33 @@ class ElecChartCard extends HTMLElement {
     this._month = null;
     this._selDay = null;
     this._detailDay = null;
+    this._mode = getPeriod() === "month" ? "month" : "day";
+    this._selMonth = null;
+    this._detailMonth = null;
     this._onAccount = () => {
       this._month = null;
       this._selDay = null;
       this._detailDay = null;
+      this._selMonth = null;
+      this._detailMonth = null;
+      this._render();
+    };
+    this._onPeriod = () => {
+      this._mode = getPeriod() === "month" ? "month" : "day";
+      this._month = null;
+      this._selDay = null;
+      this._detailDay = null;
+      this._selMonth = null;
+      this._detailMonth = null;
       this._render();
     };
     window.addEventListener(ACCOUNT_EVENT, this._onAccount);
+    window.addEventListener(PERIOD_EVENT, this._onPeriod);
   }
 
   disconnectedCallback() {
     window.removeEventListener(ACCOUNT_EVENT, this._onAccount);
+    window.removeEventListener(PERIOD_EVENT, this._onPeriod);
   }
 
   setConfig(config) {
@@ -356,7 +386,7 @@ class ElecChartCard extends HTMLElement {
     if (!acc) return "";
     const st = this._hass.states[sensorOf(acc, "previous_daily_usage")];
     const hist = st?.attributes?.daily_history;
-    return `${acc.key}|${this._month}|${this._selDay}|${this._detailDay}|${st?.state ?? ""}|${Array.isArray(hist) ? hist.length : 0}`;
+    return `${acc.key}|${this._mode}|${this._month}|${this._selDay}|${this._selMonth}|${this._detailDay}|${this._detailMonth}|${st?.state ?? ""}|${Array.isArray(hist) ? hist.length : 0}`;
   }
 
   getCardSize() {
@@ -375,6 +405,9 @@ class ElecChartCard extends HTMLElement {
     const key = getAccount(this._config);
     const acc = this._config.accounts.find((a) => a.key === key) || this._config.accounts[0];
     const hist = this._dailyOf(acc);
+
+    // 月度视图：当年各月用电量
+    if (this._mode === "month") { this._renderMonth(acc, hist); this._sig = this._signature(); return; }
 
     // 月份列表（从日数据里提取，倒序）
     const months = [...new Set(hist.map((r) => String(r.day).slice(0, 7)))].sort().reverse();
@@ -621,6 +654,198 @@ class ElecChartCard extends HTMLElement {
 
     this._sig = this._signature();
   }
+
+  _renderMonth(acc, hist) {
+    const hass = this._hass;
+    const year = new Date().getFullYear();
+    if (!hist || !hist.length) {
+      this.shadowRoot.innerHTML = `
+        <style>${BASE_CSS}</style>
+        <div class="wrap">
+          <div class="hd">
+            <div>
+              <div class="name">${acc.name} · 月用电</div>
+              <div class="cap" style="margin-top:4px">${year}年 每月用电量（度）</div>
+            </div>
+          </div>
+          <div class="panel" style="text-align:center;padding:24px 12px;color:var(--elec-muted)">
+            暂无本年度用电数据<br><span style="font-size:12px">集成需要先完成一次数据更新</span>
+          </div>
+        </div>`;
+      this._sig = this._signature();
+      return;
+    }
+    const months = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+
+    // 按 (年, 月) 聚合日数据，得到当年各月用电量
+    const byMonth = {};
+    hist.forEach((r) => {
+      const d = String(r.day);
+      if (d.slice(0, 4) === String(year) && r.usage !== null && r.usage !== undefined) {
+        const mo = Number(d.slice(5, 7));
+        if (!byMonth[mo]) {
+          byMonth[mo] = { usage: 0, charge: 0, tip: 0, peak: 0, flat: 0, valley: 0, hasCharge: false, hasParts: false };
+        }
+        const x = byMonth[mo];
+        x.usage += Number(r.usage);
+        if (r.charge !== null && r.charge !== undefined) { x.charge += Number(r.charge); x.hasCharge = true; }
+        ["tip", "peak", "flat", "valley"].forEach((k) => {
+          if (r[k] !== null && r[k] !== undefined) { x[k] += Number(r[k]); x.hasParts = true; }
+        });
+      }
+    });
+
+    const yearUsage = num(hass, sensorOf(acc, "current_year_usage"));
+    const values = months.map((m) => ({ month: m, v: byMonth[m] ? byMonth[m].usage : null }));
+    const known = values.filter((x) => x.v !== null);
+    const total = known.reduce((s, x) => s + x.v, 0);
+    const peak = known.length ? Math.max(...known.map((x) => x.v)) : 0;
+    const maxY = peak > 0 ? Math.max(20, Math.ceil((peak * 1.12) / 20) * 20) : 40;
+
+    const H = 150; // 绘图区高度(px)
+    const yTicks = [maxY, (maxY * 3) / 4, maxY / 2, maxY / 4, 0];
+    const yAxis = yTicks.map((v) => `<span>${Math.round(v)}</span>`).join("");
+    const gridLines = [0, 25, 50, 75].map((p) => `<div class="hline" style="top:${p}%"></div>`).join("");
+
+    const bars = values.map((item) => {
+      if (item.v === null) return `<div class="bar empty"></div>`;
+      const h = Math.max(2, (item.v / maxY) * H);
+      const sel = this._selMonth === item.month ? " sel" : "";
+      return `<div class="bar${sel}" data-month="${item.month}" style="height:${h.toFixed(1)}px" title="${item.month}月 · ${fmt(item.v, 2)} 度"></div>`;
+    }).join("");
+
+    // 选中月详情
+    let monthInfo;
+    if (this._selMonth !== null && byMonth[this._selMonth]) {
+      const x = byMonth[this._selMonth];
+      const mo = this._selMonth;
+      let chargeText = "";
+      if (x.hasCharge) {
+        chargeText = `<span class="d-sep">|</span>电费 <b>${fmt(x.charge, 2)}</b> 元`;
+      } else if (this._config.estimateCharge !== false) {
+        // 用年累计反推该月之前的累计量，再按阶梯分段计价
+        let after = 0;
+        for (let m2 = mo + 1; m2 <= 12; m2++) if (byMonth[m2]) after += byMonth[m2].usage;
+        const cumBefore = yearUsage === null ? null : Math.max(0, yearUsage - after - x.usage);
+        const est = cumBefore === null ? x.usage * 0.588 : tierCost(cumBefore, x.usage);
+        chargeText = `<span class="d-sep">|</span>电费 <b>≈ ${fmt(est, 2)}</b> 元<span class="d-est">（估算）</span>`;
+      }
+      monthInfo = `<span class="d-date">${mo}月</span><span class="d-sep">|</span>用电 <b>${fmt(x.usage, 2)}</b> 度${chargeText}`;
+    } else {
+      monthInfo = `<span class="d-hint">点击柱子查看当月用电</span>`;
+    }
+
+    // 分时段明细（点击展开）
+    let breakdown = "";
+    if (this._detailMonth !== null && this._detailMonth === this._selMonth && byMonth[this._selMonth]) {
+      const x = byMonth[this._selMonth];
+      const order = [
+        ["tip", "尖", "#e05e5e"],
+        ["peak", "峰", "#e08a1e"],
+        ["flat", "平", "#3b8fd9"],
+        ["valley", "谷", "#35b06f"],
+      ];
+      const items = order.filter(([k]) => x[k] > 0);
+      if (items.length) {
+        const sum = items.reduce((a, [k]) => a + x[k], 0);
+        const segs = items.map(([k, , c]) => `<span style="flex:${x[k]};background:${c}"></span>`).join("");
+        const legend = items.map(([k, label, c]) => `<span class="lg"><i style="background:${c}"></i>${label} <b>${fmt(x[k], 2)}</b> 度</span>`).join("");
+        breakdown = `<div class="bd">
+            <div class="bd-bar">${segs}</div>
+            <div class="bd-legend">${legend}<span class="lg" style="opacity:.6">合计 ${fmt(sum, 2)} 度</span></div>
+          </div>`;
+      } else {
+        breakdown = `<div class="bd-none">该月无分时（尖/峰/平/谷）数据</div>`;
+      }
+    }
+
+    // 选中柱子上方的浮动标签
+    let barTag = "";
+    if (this._selMonth !== null && byMonth[this._selMonth]) {
+      const idx = this._selMonth - 1;
+      const hSel = Math.max(2, (byMonth[this._selMonth].usage / maxY) * H);
+      const leftPct = Math.min(92, Math.max(8, ((idx + 0.5) / 12) * 100));
+      const topPx = Math.max(0, H - hSel - 22);
+      barTag = `<div class="bartag" style="left:${leftPct.toFixed(1)}%;top:${topPx.toFixed(0)}px">${this._selMonth}月 · ${fmt(byMonth[this._selMonth].usage, 1)}度</div>`;
+    }
+
+    const xAxis = months.map((m) => `<span>${m}</span>`).join("");
+
+    this.shadowRoot.innerHTML = `
+      <style>${BASE_CSS}
+        .selrow{display:flex;align-items:center;gap:8px;margin-top:12px;flex-wrap:wrap}
+        .kpi{font-size:13px;color:var(--elec-muted)}
+        .kpi b{color:var(--elec-text);font-weight:700}
+        .chart{display:flex;gap:6px;margin-top:14px;width:100%}
+        .yaxis{display:flex;flex-direction:column;justify-content:space-between;height:${H}px;
+          font-size:9px;line-height:1;color:var(--elec-muted);text-align:right;min-width:20px;flex-shrink:0}
+        .plotwrap{flex:1;min-width:0}
+        .plot{position:relative;height:${H}px;display:flex;align-items:flex-end;gap:2px}
+        .hline{position:absolute;left:0;right:0;border-top:1px solid rgba(128,128,128,.18)}
+        .bar{flex:1 1 0;min-width:0;background:var(--elec-accent);border-radius:3px 3px 0 0;opacity:.9}
+        .bar.empty{visibility:hidden}
+        .bar{cursor:pointer;transition:opacity .15s}
+        .bar.sel{background:var(--elec-orange);opacity:1}
+        .bartag{position:absolute;transform:translate(-50%,0);background:var(--elec-text);color:var(--elec-bg);
+          font-size:11px;font-weight:700;line-height:1;padding:4px 7px;border-radius:7px;white-space:nowrap;
+          z-index:4;pointer-events:none;box-shadow:0 2px 6px rgba(0,0,0,.25)}
+        .dayinfo{margin-top:10px;font-size:13px;color:var(--elec-muted);line-height:1.5;min-height:20px}
+        .dayinfo .d-date{color:var(--elec-text);font-weight:600}
+        .dayinfo b{color:var(--elec-text);font-weight:700}
+        .dayinfo .d-sep{opacity:.35;margin:0 6px}
+        .dayinfo .d-hint{opacity:.55;font-size:12px}
+        .dayinfo .d-est{opacity:.55;font-size:11px;margin-left:2px}
+        .bd{margin-top:8px}
+        .bd-bar{display:flex;height:8px;border-radius:4px;overflow:hidden;gap:1px;background:rgba(128,128,128,.15)}
+        .bd-bar span{display:block;height:100%}
+        .bd-legend{display:flex;flex-wrap:wrap;gap:10px;margin-top:7px;font-size:12px;color:var(--elec-muted)}
+        .bd-legend .lg{display:inline-flex;align-items:center;gap:4px;white-space:nowrap}
+        .bd-legend .lg i{width:7px;height:7px;border-radius:2px;display:inline-block}
+        .bd-legend b{color:var(--elec-text)}
+        .bd-none{margin-top:8px;font-size:12px;color:var(--elec-muted);opacity:.7}
+        .xaxis{display:flex;gap:2px;margin-top:4px}
+        .xaxis span{flex:1 1 0;min-width:0;text-align:center;font-size:9px;color:var(--elec-muted);overflow:hidden}
+      </style>
+      <div class="wrap">
+        <div class="hd">
+          <div>
+            <div class="name">${acc.name} · 月用电</div>
+            <div class="cap" style="margin-top:4px">${year}年 每月用电量（度）</div>
+          </div>
+          <div class="right">
+            <div class="money">${fmt(yearUsage)}<span class="unit">度</span></div>
+            <div class="cap">本年累计</div>
+          </div>
+        </div>
+
+        <div class="chart">
+          <div class="yaxis">${yAxis}</div>
+          <div class="plotwrap">
+            <div class="plot">${gridLines}${bars}${barTag}</div>
+            <div class="xaxis">${xAxis}</div>
+          </div>
+        </div>
+        <div class="dayinfo">${monthInfo}</div>
+        ${breakdown}
+      </div>`;
+
+    const plot = this.shadowRoot.querySelector(".plot");
+    if (plot) {
+      plot.addEventListener("click", (e) => {
+        const bar = e.target.closest && e.target.closest(".bar");
+        if (!bar || bar.classList.contains("empty")) return;
+        const mo = Number(bar.dataset.month);
+        if (this._selMonth === mo) {
+          this._selMonth = null;
+          this._detailMonth = null;
+        } else {
+          this._selMonth = mo;
+          this._detailMonth = mo;
+        }
+        this._render();
+      });
+    }
+  }
 }
 
 console.info("[elec-dashboard] " + VERSION + " loaded");
@@ -635,6 +860,6 @@ window.customCards.push({
 });
 window.customCards.push({
   type: "elec-chart-card",
-  name: "国家电网日用电柱状图",
-  description: "按月份查看每日用电量，跟随概览卡片的户号选择",
+  name: "国家电网用电柱状图",
+  description: "日用电 / 月用电柱状趋势图：跟随概览卡片的户号与年/月/日联动，点击柱子查看明细",
 });
