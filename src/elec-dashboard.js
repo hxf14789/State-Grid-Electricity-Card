@@ -386,7 +386,10 @@ class ElecChartCard extends HTMLElement {
     if (!acc) return "";
     const st = this._hass.states[sensorOf(acc, "previous_daily_usage")];
     const hist = st?.attributes?.daily_history;
-    return `${acc.key}|${this._mode}|${this._month}|${this._selDay}|${this._selMonth}|${this._detailDay}|${this._detailMonth}|${st?.state ?? ""}|${Array.isArray(hist) ? hist.length : 0}`;
+    const sb = this._hass.states[sensorOf(acc, "previous_settled_month_usage")]
+      || this._hass.states[sensorOf(acc, "latest_month_usage")];
+    const bills = sb?.attributes?.monthly_bill_history;
+    return `${acc.key}|${this._mode}|${this._month}|${this._selDay}|${this._selMonth}|${this._detailDay}|${this._detailMonth}|${st?.state ?? ""}|${Array.isArray(hist) ? hist.length : 0}|${sb?.state ?? ""}|${Array.isArray(bills) ? bills.length : 0}`;
   }
 
   getCardSize() {
@@ -397,6 +400,18 @@ class ElecChartCard extends HTMLElement {
     const st = this._hass?.states[sensorOf(acc, "previous_daily_usage")];
     const hist = st?.attributes?.daily_history;
     return Array.isArray(hist) ? hist : [];
+  }
+
+  // 月账单：来自国网月度账单接口，覆盖本年所有已出账月份（不受「查询最近 1-3 个月」限制）
+  _billsOf(acc) {
+    // 该属性挂在「上月用电量」传感器上，集成新旧版本实体名不同，两个 key 都试
+    const keys = ["previous_settled_month_usage", "latest_month_usage"];
+    for (const k of keys) {
+      const st = this._hass?.states[sensorOf(acc, k)];
+      const bills = st?.attributes?.monthly_bill_history;
+      if (Array.isArray(bills) && bills.length) return bills;
+    }
+    return [];
   }
 
   _render() {
@@ -658,7 +673,7 @@ class ElecChartCard extends HTMLElement {
   _renderMonth(acc, hist) {
     const hass = this._hass;
     const year = new Date().getFullYear();
-    if (!hist || !hist.length) {
+    if ((!hist || !hist.length) && !this._billsOf(acc).length) {
       this.shadowRoot.innerHTML = `
         <style>${BASE_CSS}</style>
         <div class="wrap">
@@ -677,22 +692,57 @@ class ElecChartCard extends HTMLElement {
     }
     const months = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
 
-    // 按 (年, 月) 聚合日数据，得到当年各月用电量
-    const byMonth = {};
+    // 1) 月账单（monthly_bill_history）：本年已出账月份的真实电量与电费，可覆盖全年
+    const bills = this._billsOf(acc);
+    const billByMonth = {};
+    bills.forEach((b) => {
+      const s = String(b.month || ""); // "YYYY-MM"
+      if (s.slice(0, 4) !== String(year)) return;
+      const mo = Number(s.slice(5, 7));
+      if (mo >= 1 && mo <= 12) billByMonth[mo] = b;
+    });
+
+    // 2) 日数据聚合：补齐当月等尚未出账的部分，并提供尖/峰/平/谷分时
+    const dailyByMonth = {};
     hist.forEach((r) => {
       const d = String(r.day);
       if (d.slice(0, 4) === String(year) && r.usage !== null && r.usage !== undefined) {
         const mo = Number(d.slice(5, 7));
-        if (!byMonth[mo]) {
-          byMonth[mo] = { usage: 0, charge: 0, tip: 0, peak: 0, flat: 0, valley: 0, hasCharge: false, hasParts: false };
+        if (!dailyByMonth[mo]) {
+          dailyByMonth[mo] = { usage: 0, charge: 0, tip: 0, peak: 0, flat: 0, valley: 0, hasCharge: false, hasParts: false };
         }
-        const x = byMonth[mo];
+        const x = dailyByMonth[mo];
         x.usage += Number(r.usage);
         if (r.charge !== null && r.charge !== undefined) { x.charge += Number(r.charge); x.hasCharge = true; }
         ["tip", "peak", "flat", "valley"].forEach((k) => {
           if (r[k] !== null && r[k] !== undefined) { x[k] += Number(r[k]); x.hasParts = true; }
         });
       }
+    });
+
+    // 3) 合并：电量与电费优先取账单，缺失时由日数据聚合补齐
+    const byMonth = {};
+    months.forEach((m) => {
+      const b = billByMonth[m];
+      const d = dailyByMonth[m];
+      const usage = b && b.usage !== null && b.usage !== undefined
+        ? Number(b.usage)
+        : (d ? d.usage : null);
+      const charge = b && b.charge !== null && b.charge !== undefined
+        ? Number(b.charge)
+        : (d && d.hasCharge ? d.charge : null);
+      if (usage === null && charge === null) return;
+      byMonth[m] = {
+        usage,
+        charge: charge === null ? 0 : charge,
+        hasCharge: charge !== null,
+        fromBill: !!b,
+        tip: d ? d.tip : 0,
+        peak: d ? d.peak : 0,
+        flat: d ? d.flat : 0,
+        valley: d ? d.valley : 0,
+        hasParts: !!(d && d.hasParts),
+      };
     });
 
     const yearUsage = num(hass, sensorOf(acc, "current_year_usage"));
@@ -722,10 +772,10 @@ class ElecChartCard extends HTMLElement {
       let chargeText = "";
       if (x.hasCharge) {
         chargeText = `<span class="d-sep">|</span>电费 <b>${fmt(x.charge, 2)}</b> 元`;
-      } else if (this._config.estimateCharge !== false) {
+      } else if (this._config.estimateCharge !== false && x.usage !== null) {
         // 用年累计反推该月之前的累计量，再按阶梯分段计价
         let after = 0;
-        for (let m2 = mo + 1; m2 <= 12; m2++) if (byMonth[m2]) after += byMonth[m2].usage;
+        for (let m2 = mo + 1; m2 <= 12; m2++) if (byMonth[m2] && byMonth[m2].usage) after += byMonth[m2].usage;
         const cumBefore = yearUsage === null ? null : Math.max(0, yearUsage - after - x.usage);
         const est = cumBefore === null ? x.usage * 0.588 : tierCost(cumBefore, x.usage);
         chargeText = `<span class="d-sep">|</span>电费 <b>≈ ${fmt(est, 2)}</b> 元<span class="d-est">（估算）</span>`;
@@ -755,13 +805,13 @@ class ElecChartCard extends HTMLElement {
             <div class="bd-legend">${legend}<span class="lg" style="opacity:.6">合计 ${fmt(sum, 2)} 度</span></div>
           </div>`;
       } else {
-        breakdown = `<div class="bd-none">该月无分时（尖/峰/平/谷）数据</div>`;
+        breakdown = `<div class="bd-none">该月无分时（尖/峰/平/谷）数据<span style="opacity:.7">（分时仅覆盖集成最近查询的几个月）</span></div>`;
       }
     }
 
     // 选中柱子上方的浮动标签
     let barTag = "";
-    if (this._selMonth !== null && byMonth[this._selMonth]) {
+    if (this._selMonth !== null && byMonth[this._selMonth] && byMonth[this._selMonth].usage !== null) {
       const idx = this._selMonth - 1;
       const hSel = Math.max(2, (byMonth[this._selMonth].usage / maxY) * H);
       const leftPct = Math.min(92, Math.max(8, ((idx + 0.5) / 12) * 100));
