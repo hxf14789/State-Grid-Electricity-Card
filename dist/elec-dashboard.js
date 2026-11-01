@@ -64,6 +64,8 @@ const BASE_CSS = `
   transition:background .15s,color .15s;user-select:none}
 .tab.on{background:var(--elec-accent);color:var(--elec-on-accent);font-weight:700}
 .panel{background:var(--elec-panel);border-radius:16px;padding:12px;margin-top:14px}
+.bar{transform-origin:bottom}
+@keyframes elecBarGrow{from{transform:scaleY(0)}to{transform:scaleY(1)}}
 .bubble{background:linear-gradient(90deg,#f7b733,#fc8d3a);color:#fff;font-weight:700;font-size:13px;
   border-radius:18px;padding:8px 12px;text-align:center}
 .steps{position:relative;display:flex;margin-top:12px}
@@ -91,7 +93,7 @@ function setAccount(key) {
   window.dispatchEvent(new CustomEvent(ACCOUNT_EVENT, { detail: key }));
 }
 
-const VERSION = "v1.1.0";
+const VERSION = "v1.1.1";
 
 function accNumber(acc, hass) {
   // YAML 会把 no: 解析成布尔 false，这里兼容所有可能写法
@@ -339,6 +341,7 @@ class ElecChartCard extends HTMLElement {
     this._selMonth = null;
     this._detailMonth = null;
     this._onAccount = () => {
+      this._animateBars = true;
       this._month = null;
       this._selDay = null;
       this._detailDay = null;
@@ -347,6 +350,7 @@ class ElecChartCard extends HTMLElement {
       this._render();
     };
     this._onPeriod = () => {
+      this._animateBars = true;
       this._mode = getPeriod() === "month" ? "month" : "day";
       this._month = null;
       this._selDay = null;
@@ -357,6 +361,7 @@ class ElecChartCard extends HTMLElement {
     };
     window.addEventListener(ACCOUNT_EVENT, this._onAccount);
     window.addEventListener(PERIOD_EVENT, this._onPeriod);
+    this._animateBars = true; // 首次进入时播放柱子生长动画
   }
 
   disconnectedCallback() {
@@ -417,12 +422,14 @@ class ElecChartCard extends HTMLElement {
   _render() {
     if (!this._hass || !this._config) return;
     const hass = this._hass;
+    const anim = this._animateBars; // 仅在本轮（进入视图/换月份/换户号）播放一次柱子生长动画
+    this._animateBars = false;
     const key = getAccount(this._config);
     const acc = this._config.accounts.find((a) => a.key === key) || this._config.accounts[0];
     const hist = this._dailyOf(acc);
 
     // 月度视图：当年各月用电量
-    if (this._mode === "month") { this._renderMonth(acc, hist); this._sig = this._signature(); return; }
+    if (this._mode === "month") { this._renderMonth(acc, hist, anim); this._sig = this._signature(); return; }
 
     // 月份列表（从日数据里提取，倒序）
     const months = [...new Set(hist.map((r) => String(r.day).slice(0, 7)))].sort().reverse();
@@ -480,11 +487,12 @@ class ElecChartCard extends HTMLElement {
       .join("");
 
     const bars = values
-      .map((item) => {
+      .map((item, i) => {
         if (item.v === null) return `<div class="bar empty"></div>`;
         const h = Math.max(2, (item.v / maxY) * H);
         const sel = this._selDay === item.day ? " sel" : "";
-        return `<div class="bar${sel}" data-day="${item.day}" style="height:${h.toFixed(1)}px" title="${item.day}日 · ${fmt(item.v, 2)} 度"></div>`;
+        const animCss = anim ? `animation:elecBarGrow .5s ease-out ${i * 45}ms both;` : "";
+        return `<div class="bar${sel}" data-day="${item.day}" style="height:${h.toFixed(1)}px;${animCss}" title="${item.day}日 · ${fmt(item.v, 2)} 度"></div>`;
       })
       .join("");
 
@@ -661,6 +669,7 @@ class ElecChartCard extends HTMLElement {
     });
 
     this.shadowRoot.getElementById("monthSel").addEventListener("change", (e) => {
+      this._animateBars = true;
       this._selDay = null;
       this._month = e.target.value;
       this._selDay = null;
@@ -670,7 +679,7 @@ class ElecChartCard extends HTMLElement {
     this._sig = this._signature();
   }
 
-  _renderMonth(acc, hist) {
+  _renderMonth(acc, hist, anim) {
     const hass = this._hass;
     const year = new Date().getFullYear();
     if ((!hist || !hist.length) && !this._billsOf(acc).length) {
@@ -757,11 +766,12 @@ class ElecChartCard extends HTMLElement {
     const yAxis = yTicks.map((v) => `<span>${Math.round(v)}</span>`).join("");
     const gridLines = [0, 25, 50, 75].map((p) => `<div class="hline" style="top:${p}%"></div>`).join("");
 
-    const bars = values.map((item) => {
+    const bars = values.map((item, i) => {
       if (item.v === null) return `<div class="bar empty"></div>`;
       const h = Math.max(2, (item.v / maxY) * H);
       const sel = this._selMonth === item.month ? " sel" : "";
-      return `<div class="bar${sel}" data-month="${item.month}" style="height:${h.toFixed(1)}px" title="${item.month}月 · ${fmt(item.v, 2)} 度"></div>`;
+      const animCss = anim ? `animation:elecBarGrow .5s ease-out ${i * 45}ms both;` : "";
+      return `<div class="bar${sel}" data-month="${item.month}" style="height:${h.toFixed(1)}px;${animCss}" title="${item.month}月 · ${fmt(item.v, 2)} 度"></div>`;
     }).join("");
 
     // 选中月详情
